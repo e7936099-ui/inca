@@ -4,10 +4,11 @@ import plotly.express as px
 from collections import Counter, defaultdict
 from typing import List, Optional, Any, Dict
 from itertools import combinations
+import numpy as np
 
 # --- Configuración de la Página de Streamlit ---
 st.set_page_config(
-    page_title="🔮 Predicción de Lotería",
+    page_title="🔮 Predictor de Lotería Estratégico",
     page_icon="🔮",
     layout="wide",
     initial_sidebar_state="auto"
@@ -32,10 +33,7 @@ def safe_to_int(series: pd.Series) -> pd.Series:
 
 @st.cache_data
 def load_and_process_data(file_source) -> Optional[pd.DataFrame]:
-    """
-    Carga y procesa el archivo Excel desde una ruta o un objeto subido.
-    Cacheado para optimizar rendimiento.
-    """
+    """Carga y procesa el archivo Excel."""
     try:
         df = pd.read_excel(file_source)
         required_columns = ['Bolillas', 'YaPa', 'Adicionales']
@@ -60,164 +58,162 @@ def load_and_process_data(file_source) -> Optional[pd.DataFrame]:
 
 def get_full_analysis(df: pd.DataFrame) -> Dict[str, Any]:
     """Realiza un análisis completo que incluye frecuencia, recencia y patrones."""
-    
-    # --- Frecuencia (Números Calientes) ---
     all_bolillas = [num for sublist in df['Bolillas'] for num in sublist]
     freq_bolillas = Counter(all_bolillas)
-    freq_yapa = Counter(all_yapa if (all_yapa := [num for num in df['YaPa'].dropna()]) else [])
-    freq_adicionales = Counter(all_adicionales if (all_adicionales := [num for sublist in df['Adicionales'] for num in sublist]) else [])
+    all_numbers = sorted(list(freq_bolillas.keys()))
 
-    # --- Recencia (Última Vez Vistos) ---
-    last_seen_bolillas = {}
+    last_seen_bolillas = {num: len(df) for num in all_numbers}
     for index, row in df.iterrows():
         for num in row['Bolillas']:
-            if num not in last_seen_bolillas:
-                last_seen_bolillas[num] = row['Sorteo_ID']
+            last_seen_bolillas[num] = row['Sorteo_ID']
     df_recencia = pd.DataFrame(list(last_seen_bolillas.items()), columns=['Número', 'Sorteos Atrás']).sort_values(by='Sorteos Atrás').reset_index(drop=True)
 
-    # --- ANÁLISIS DE PATRONES ---
-    
-    # 1. Pares más comunes
     all_pairs = [pair for sublist in df['Bolillas'] for pair in combinations(sorted(sublist), 2)]
     pairs_counter = Counter(all_pairs)
-
-    # 2. Números siguientes
-    following_numbers = defaultdict(Counter)
-    for i in range(len(df) - 1):
-        current_draw_numbers = df.iloc[i]['Bolillas']
-        next_draw_numbers = df.iloc[i+1]['Bolillas']
-        for num in current_draw_numbers:
-            following_numbers[num].update(next_draw_numbers)
-
-    # 3. Ratio Pares/Impares y Sumas
-    odd_even_ratios = []
-    sums = []
-    for sublist in df['Bolillas']:
-        if sublist:
-            evens = sum(1 for num in sublist if num % 2 == 0)
-            odds = len(sublist) - evens
-            odd_even_ratios.append(f"{evens} Pares, {odds} Impares")
-            sums.append(sum(sublist))
     
     return {
+        "all_numbers": all_numbers,
         "freq_bolillas": freq_bolillas,
-        "freq_yapa": freq_yapa,
-        "freq_adicionales": freq_adicionales,
+        "freq_yapa": Counter([num for num in df['YaPa'].dropna()]),
+        "freq_adicionales": Counter([num for sublist in df['Adicionales'] for num in sublist]),
         "recencia": df_recencia,
         "pairs": pairs_counter,
-        "following_numbers": following_numbers,
-        "odd_even_ratios": Counter(odd_even_ratios),
-        "sums": sums
     }
+
+def calculate_recommendations(analysis: Dict[str, Any], w_hot: float, w_cold: float, w_pairs: float) -> pd.DataFrame:
+    """Calcula el puntaje de recomendación para cada número."""
+    df_scores = pd.DataFrame(analysis['all_numbers'], columns=['Número'])
+
+    # 1. Puntaje Caliente (Frecuencia)
+    freq_map = analysis['freq_bolillas']
+    df_scores['Frecuencia'] = df_scores['Número'].map(freq_map)
+    min_freq, max_freq = df_scores['Frecuencia'].min(), df_scores['Frecuencia'].max()
+    df_scores['Puntaje_Caliente'] = (df_scores['Frecuencia'] - min_freq) / (max_freq - min_freq) if max_freq > min_freq else 0
+
+    # 2. Puntaje Frío (Recencia)
+    recencia_map = analysis['recencia'].set_index('Número')['Sorteos Atrás']
+    df_scores['Sorteos_Atras'] = df_scores['Número'].map(recencia_map)
+    min_rec, max_rec = df_scores['Sorteos_Atras'].min(), df_scores['Sorteos_Atras'].max()
+    df_scores['Puntaje_Frio'] = (df_scores['Sorteos_Atras'] - min_rec) / (max_rec - min_rec) if max_rec > min_rec else 0
+    
+    # 3. Puntaje de Pares
+    pairs_map = defaultdict(int)
+    for pair, freq in analysis['pairs'].items():
+        pairs_map[pair[0]] += freq
+        pairs_map[pair[1]] += freq
+    df_scores['Puntaje_Pares_Raw'] = df_scores['Número'].map(pairs_map)
+    min_pair, max_pair = df_scores['Puntaje_Pares_Raw'].min(), df_scores['Puntaje_Pares_Raw'].max()
+    df_scores['Puntaje_Pares'] = (df_scores['Puntaje_Pares_Raw'] - min_pair) / (max_pair - min_pair) if max_pair > min_pair else 0
+
+    # 4. Puntaje Total
+    df_scores['Puntaje_Total'] = (
+        w_hot * df_scores['Puntaje_Caliente'] +
+        w_cold * df_scores['Puntaje_Frio'] +
+        w_pairs * df_scores['Puntaje_Pares']
+    )
+    
+    return df_scores.sort_values(by='Puntaje_Total', ascending=False).reset_index(drop=True)
+
 
 # --- Interfaz de Usuario (UI) ---
 
-st.title("🔮 Predictor de Lotería Basado en Estadísticas y Patrones")
-st.markdown("""
-Analiza el historial de sorteos para descubrir no solo los números más frecuentes, sino también **patrones ocultos**, **pares comunes** y **tendencias** que podrían ayudarte en tu próxima jugada.
-""")
+st.title("🔮 Predictor de Lotería Estratégico")
+st.markdown("Esta herramienta analiza datos históricos para ofrecerte una **recomendación estratégica**. Define tu propia estrategia ajustando los pesos de los diferentes factores de análisis.")
 
 with st.sidebar:
-    st.header("⚙️ Configuración")
+    st.header("⚙️ Configuración de Análisis")
     source_choice = st.radio("Elige la fuente de datos", ("Usar archivo por defecto (inca.xlsx)", "Subir un archivo personalizado"))
     archivo = 'inca.xlsx' if source_choice == "Usar archivo por defecto (inca.xlsx)" else st.file_uploader("Sube tu archivo Excel (.xlsx)", type=["xlsx"])
     
-    st.subheader("Cantidad de Números a Predecir")
-    num_bolillas_pred = st.slider("Bolillas", 1, 20, 6)
-    num_yapa_pred = st.slider("YaPa", 1, 10, 1)
-    num_adicionales_pred = st.slider("Adicionales", 1, 10, 2)
-
+    st.header("⚖️ Define tu Estrategia")
+    st.markdown("Ajusta la importancia de cada factor en la predicción.")
+    weight_hot = st.slider("🔥 Factor Caliente (Frecuencia)", 0.0, 1.0, 0.4, 0.05)
+    weight_cold = st.slider("❄️ Factor Frío (Ausencia)", 0.0, 1.0, 0.3, 0.05)
+    weight_pairs = st.slider("🤝 Factor de Pares (Compañerismo)", 0.0, 1.0, 0.3, 0.05)
+    
+    # Normalizar pesos para que sumen 1
+    total_weight = weight_hot + weight_cold + weight_pairs
+    if total_weight > 0:
+        weight_hot /= total_weight
+        weight_cold /= total_weight
+        weight_pairs /= total_weight
+    
 if archivo:
     df = load_and_process_data(archivo)
     if df is not None:
-        st.success(f"¡Archivo cargado y procesado! Se han analizado **{len(df)}** sorteos.")
         analysis = get_full_analysis(df)
-        pred_bolillas = [num for num, _ in analysis['freq_bolillas'].most_common(num_bolillas_pred)]
-        pred_yapa = [num for num, _ in analysis['freq_yapa'].most_common(num_yapa_pred)]
-        pred_adicionales = [num for num, _ in analysis['freq_adicionales'].most_common(num_adicionales_pred)]
         
-        st.header("📊 Tu Predicción Personalizada")
-        col1, col2, col3 = st.columns(3)
-        with col1: st.metric("Bolillas", " - ".join(map(str, sorted(pred_bolillas))))
-        with col2: st.metric("YaPa", " - ".join(map(str, sorted(pred_yapa))))
-        with col3: st.metric("Adicionales", " - ".join(map(str, sorted(pred_adicionales))))
-            
+        st.success(f"¡Archivo cargado y procesado! Se han analizado **{len(df)}** sorteos.")
+        
+        df_recommendations = calculate_recommendations(analysis, weight_hot, weight_cold, weight_pairs)
+        
+        # --- Predicción Principal ---
+        st.header("🔮 Recomendación Estratégica")
+        pred_bolillas = df_recommendations['Número'].head(6).tolist()
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.metric("Bolillas Recomendadas (Solo 6)", " - ".join(map(str, sorted(pred_bolillas))))
+            # Predicciones simples para YaPa y Adicionales
+            pred_yapa = analysis['freq_yapa'].most_common(1)[0][0] if analysis['freq_yapa'] else 'N/A'
+            st.metric("YaPa (Más Frecuente)", str(pred_yapa))
+            pred_adicionales = [num for num, _ in analysis['freq_adicionales'].most_common(2)]
+            st.metric("Adicionales (Más Frecuentes)", " - ".join(map(str, sorted(pred_adicionales))))
+
+        with col2:
+            st.subheader("Estrategia Aplicada")
+            st.markdown(f"**🔥 Caliente:** `{weight_hot:.0%}`")
+            st.markdown(f"**❄️ Frío:** `{weight_cold:.0%}`")
+            st.markdown(f"**🤝 Pares:** `{weight_pairs:.0%}`")
+
         with st.container(border=True):
-            st.subheader("💡 ¿Por qué estos números?")
+            st.subheader("💡 ¿Cómo se eligieron estos números?")
             st.markdown(f"""
-            Esta predicción se basa en los **"números calientes"** (los que más han aparecido). Por ejemplo, el **{pred_bolillas[0]}** ha salido **{analysis['freq_bolillas'][pred_bolillas[0]]}** veces.
-            Para un análisis más profundo, explora la pestaña **"Análisis de Patrones"**.
+            La recomendación se basa en un **Puntaje de Probabilidad** calculado para cada número. Este puntaje combina tres análisis clave con la importancia que definiste:
+
+            1.  **Factor Caliente (`{weight_hot:.0%}`):** Prioriza los números que han salido con más frecuencia.
+            2.  **Factor Frío (`{weight_cold:.0%}`):** Da más puntos a los números que llevan más tiempo sin salir.
+            3.  **Factor de Pares (`{weight_pairs:.0%}`):** Beneficia a los números que suelen salir acompañados de otros números frecuentes.
             
-            *Recuerda que la lotería es un juego de azar. Este análisis es una herramienta estadística y no garantiza resultados futuros.*
+            Los **6 números recomendados** son aquellos con el puntaje total más alto. Abajo puedes ver la tabla de clasificación completa.
             """)
 
-        st.header("🔍 Análisis Profundo de los Datos")
-        tab1, tab2, tab3, tab4 = st.tabs(["🔥 Calientes", "❄️ Fríos", "⏰ Recencia", "🔎 Patrones"])
+        st.subheader("🏆 Tabla de Clasificación de Números")
+        st.dataframe(df_recommendations[[
+            'Número', 'Puntaje_Total', 'Puntaje_Caliente', 'Puntaje_Frio', 'Puntaje_Pares', 'Frecuencia', 'Sorteos_Atras'
+        ]].head(20), use_container_width=True)
 
-        with tab1:
-            # ... (contenido sin cambios)
-            st.subheader("Top de Números por Frecuencia")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.write("**Bolillas:**"); st.dataframe(pd.DataFrame(analysis['freq_bolillas'].most_common(15), columns=['Número', 'Frecuencia']))
-            with c2:
-                st.write("**YaPa:**"); st.dataframe(pd.DataFrame(analysis['freq_yapa'].most_common(10), columns=['Número', 'Frecuencia']))
-            with c3:
-                st.write("**Adicionales:**"); st.dataframe(pd.DataFrame(analysis['freq_adicionales'].most_common(10), columns=['Número', 'Frecuencia']))
-            df_freq = pd.DataFrame(analysis['freq_bolillas'].most_common(20), columns=['Número', 'Frecuencia']).sort_values(by='Frecuencia')
-            df_freq['Número'] = df_freq['Número'].astype(str)
-            st.plotly_chart(px.bar(df_freq, x='Frecuencia', y='Número', orientation='h', title='Frecuencia de las 20 Bolillas más comunes'), use_container_width=True)
 
-        with tab2:
-            # ... (contenido sin cambios)
-            st.subheader("Los Números que Menos Han Salido")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.write("**Bolillas:**"); st.dataframe(pd.DataFrame(analysis['freq_bolillas'].most_common()[:-16:-1], columns=['Número', 'Frecuencia']))
-            with c2:
-                st.write("**YaPa:**"); st.dataframe(pd.DataFrame(analysis['freq_yapa'].most_common()[:-11:-1], columns=['Número', 'Frecuencia']))
-            with c3:
-                st.write("**Adicionales:**"); st.dataframe(pd.DataFrame(analysis['freq_adicionales'].most_common()[:-11:-1], columns=['Número', 'Frecuencia']))
+        # --- Análisis Profundo ---
+        with st.expander("🔍 Análisis Profundo de los Datos"):
+            st.header("Análisis Detallado")
+            tab1, tab2, tab3 = st.tabs(["🔥 Frecuencia", "❄️ Recencia", "🤝 Pares"])
 
-        with tab3:
-            st.subheader("Análisis de Recencia de Bolillas")
-            st.markdown("Cuántos sorteos han pasado desde la última vez que apareció cada bolilla. '0' = último sorteo.")
-            st.dataframe(analysis['recencia'], use_container_width=True)
+            with tab1:
+                st.subheader("Top de Números por Frecuencia")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.write("**Bolillas:**"); st.dataframe(pd.DataFrame(analysis['freq_bolillas'].most_common(15), columns=['Número', 'Frecuencia']))
+                with c2:
+                    st.write("**YaPa:**"); st.dataframe(pd.DataFrame(analysis['freq_yapa'].most_common(10), columns=['Número', 'Frecuencia']))
+                with c3:
+                    st.write("**Adicionales:**"); st.dataframe(pd.DataFrame(analysis['freq_adicionales'].most_common(10), columns=['Número', 'Frecuencia']))
+                df_freq = pd.DataFrame(analysis['freq_bolillas'].most_common(20), columns=['Número', 'Frecuencia']).sort_values(by='Frecuencia')
+                df_freq['Número'] = df_freq['Número'].astype(str)
+                st.plotly_chart(px.bar(df_freq, x='Frecuencia', y='Número', orientation='h', title='Frecuencia de las 20 Bolillas más comunes'), use_container_width=True)
 
-        with tab4:
-            st.subheader("Pares de Bolillas Más Comunes")
-            st.markdown("Estos son los dúos de números que más veces han aparecido juntos en el mismo sorteo.")
-            df_pairs = pd.DataFrame(analysis['pairs'].most_common(15), columns=['Par', 'Frecuencia'])
-            df_pairs['Par'] = df_pairs['Par'].astype(str)
-            st.dataframe(df_pairs, use_container_width=True)
+            with tab2:
+                st.subheader("Análisis de Recencia de Bolillas")
+                st.markdown("Cuántos sorteos han pasado desde la última vez que apareció cada bolilla. '0' = último sorteo.")
+                st.dataframe(analysis['recencia'], use_container_width=True)
 
-            st.subheader("Probabilidad de Números Siguientes")
-            st.markdown("Selecciona un número para ver cuáles son los que más probablemente salgan en el **sorteo siguiente**.")
-            sorted_bolillas = sorted(analysis['freq_bolillas'].keys())
-            selected_num = st.selectbox("Elige un número para analizar:", options=sorted_bolillas, index=sorted_bolillas.index(pred_bolillas[0]) if pred_bolillas[0] in sorted_bolillas else 0)
-            if selected_num in analysis['following_numbers']:
-                following_data = analysis['following_numbers'][selected_num]
-                df_following = pd.DataFrame(following_data.most_common(10), columns=['Número Siguiente', 'Frecuencia'])
-                st.dataframe(df_following, use_container_width=True)
-            else:
-                st.warning(f"El número {selected_num} no tiene datos de sorteos siguientes (podría ser del último sorteo registrado).")
-            
-            st.subheader("Estadísticas Generales del Sorteo")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Ratio Pares / Impares Más Común**")
-                df_ratios = pd.DataFrame(analysis['odd_even_ratios'].most_common(5), columns=['Combinación', 'Frecuencia'])
-                st.dataframe(df_ratios)
-            with col2:
-                st.markdown("**Distribución de la Suma de Bolillas**")
-                if analysis['sums']:
-                    fig_sums = px.histogram(pd.DataFrame(analysis['sums'], columns=['Suma']), x='Suma', nbins=30, title="Frecuencia de la Suma Total de Bolillas")
-                    st.plotly_chart(fig_sums, use_container_width=True)
-                else:
-                    st.write("No hay datos de suma para mostrar.")
+            with tab3:
+                st.subheader("Pares de Bolillas Más Comunes")
+                st.markdown("Estos son los dúos de números que más veces han aparecido juntos en el mismo sorteo.")
+                df_pairs = pd.DataFrame(analysis['pairs'].most_common(15), columns=['Par', 'Frecuencia'])
+                df_pairs['Par'] = df_pairs['Par'].astype(str)
+                st.dataframe(df_pairs, use_container_width=True)
 
-        with st.expander("Vista Previa de los Datos Procesados"):
-            st.dataframe(df.head())
 else:
-    st.info("👈 Elige una fuente de datos en la barra lateral para comenzar el análisis.")
+    st.info("👈 Elige una fuente de datos y define tu estrategia en la barra lateral para comenzar.")
 
